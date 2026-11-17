@@ -1,0 +1,9 @@
+# Jangan pernah commit file video atau hasil transcode ke repo ini.
+# Film sumber dan segmen HLS tinggal di B2, bukan di git.
+input/
+out/
+*.mp4
+*.mkv
+*.webm
+*.ts
+*.m3u8

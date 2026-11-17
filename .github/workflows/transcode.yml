@@ -1,0 +1,252 @@
+# Transcode film menjadi HLS (segmen 6 detik) + MP4 progresif.
+#
+# Satu job per kualitas (matrix 360p / 720p / 1080p, H.264). VP9 dan AV1
+# sengaja tidak ada di sini: diukur di VM, VP9 0,037x dan AV1 0,07x
+# realtime, jadi satu film 2 jam butuh belasan jam dan tidak muat di
+# batas 6 jam per job GitHub Actions.
+#
+# Runner dipin ke ubuntu-24.04. Label ubuntu-latest pindah ke Ubuntu
+# 26.04 pada November 2026, jadi memakai latest berarti image berubah
+# diam-diam di tengah jalan.
+#
+# ffmpeg TIDAK terpasang di image runner (terverifikasi dari readme
+# image 20261111.370.1), jadi workflow memasangnya lewat apt-get.
+#
+# Hasil WAJIB diunggah langsung ke Backblaze B2 dari dalam job.
+# Artefak GitHub Actions dibatasi 500 MB di free tier, sementara satu
+# film 1080p saja ~5,5 GB. Artefak di sini hanya menyimpan playlist
+# .m3u8 dan ringkasan JSON (kilobyte), bukan segmen video.
+#
+# Jalankan dari tab Actions > Transcode to HLS > Run workflow.
+# Kosongkan source_url untuk mode tes: tiap job membuat video sintetis
+# (testsrc2 + nada 440 Hz) lalu men-transcode-nya. Mode tes tidak
+# butuh file eksternal dan tidak mengunggah apa pun ke B2.
+
+name: Transcode to HLS
+
+on:
+  workflow_dispatch:
+    inputs:
+      film_slug:
+        description: "Slug film, jadi nama folder di B2: films/<slug>/ (contoh: bougainvillea-2024)"
+        required: true
+        default: "test-film"
+        type: string
+      source_url:
+        description: "URL video sumber (presigned B2 / tautan unduh Drive). KOSONGKAN untuk mode tes: video sintetis dibuat di dalam job."
+        required: false
+        default: ""
+        type: string
+      test_seconds:
+        description: "Durasi video sintetis dalam detik. Hanya dipakai bila source_url kosong."
+        required: false
+        default: "30"
+        type: string
+      upload:
+        description: "Unggah hasil ke B2. Butuh secrets B2_KEY_ID, B2_APP_KEY, B2_BUCKET di repo ini."
+        required: false
+        default: false
+        type: boolean
+
+# Satu film hanya ditranscode satu run pada satu waktu. Run kedua
+# untuk slug yang sama menunggu, bukan menimpa hasil run pertama.
+concurrency:
+  group: transcode-${{ inputs.film_slug }}
+  cancel-in-progress: false
+
+jobs:
+  transcode:
+    name: Transcode ${{ matrix.quality }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - quality: 360p
+            width: 640
+            height: 360
+            video_bitrate: 1000k
+          - quality: 720p
+            width: 1280
+            height: 720
+            video_bitrate: 2500k
+          - quality: 1080p
+            width: 1920
+            height: 1080
+            video_bitrate: 6000k
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Periksa slug film
+        run: |
+          SLUG='${{ inputs.film_slug }}'
+          if ! printf '%s' "$SLUG" | grep -Eq '^[a-z0-9][a-z0-9-]*$'; then
+            echo "::error::film_slug '$SLUG' tidak valid. Pakai huruf kecil, angka, dan strip saja (contoh: bougainvillea-2024)."
+            exit 1
+          fi
+          echo "Slug valid: $SLUG"
+
+      - name: Pasang ffmpeg dan rclone
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg rclone
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+          rclone version | head -1
+
+      - name: Siapkan video sumber
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          mkdir -p input out
+          if [ -z "$SOURCE_URL" ]; then
+            echo "Mode tes: membuat video sintetis ${{ inputs.test_seconds }} detik (${{ matrix.width }}x${{ matrix.height }}, testsrc2 + nada 440 Hz)."
+            echo "testsrc2 adalah pola uji penuh detail acak, kasus terberat buat encoder. Film asli di-encode lebih cepat."
+            ffmpeg -hide_banner -loglevel error -y \
+              -f lavfi -i "testsrc2=size=${{ matrix.width }}x${{ matrix.height }}:rate=30:duration=${{ inputs.test_seconds }}" \
+              -f lavfi -i "sine=frequency=440:duration=${{ inputs.test_seconds }}" \
+              -map 0:v -map 1:a -c:v libx264 -preset veryfast -c:a aac -shortest \
+              input/source.mp4
+            INPUT_FILE=input/source.mp4
+          else
+            echo "Mengunduh video sumber (URL dari parameter dispatch, tanpa kredensial di repo)."
+            curl -fL --retry 3 --retry-delay 5 -o input/source.bin "$SOURCE_URL"
+            INPUT_FILE=input/source.bin
+          fi
+          echo "INPUT_FILE=$INPUT_FILE" >> "$GITHUB_ENV"
+          echo "--- info file sumber ---"
+          ffprobe -v error -show_entries format=duration,size \
+            -show_entries stream=index,codec_name,codec_type,width,height,channels \
+            -of default=noprint_wrappers=1 "$INPUT_FILE"
+
+      - name: Transcode ke HLS + MP4
+        run: |
+          START=$SECONDS
+          bash scripts/transcode.sh "$INPUT_FILE" out "${{ matrix.quality }}" \
+            "${{ matrix.width }}" "${{ matrix.height }}" "${{ matrix.video_bitrate }}" 6
+          echo "TRANSCODE_SECONDS=$((SECONDS - START))" >> "$GITHUB_ENV"
+          echo "Transcode makan $((SECONDS - START)) detik."
+
+      - name: Validasi hasil dengan ffprobe
+        run: |
+          Q='${{ matrix.quality }}'
+          PLAYLIST="out/stream_${Q}.m3u8"
+          test -f "$PLAYLIST" || { echo "::error::Playlist $PLAYLIST tidak ada."; exit 1; }
+          grep -q '#EXT-X-ENDLIST' "$PLAYLIST" || { echo "::error::Playlist $PLAYLIST tidak ditutup #EXT-X-ENDLIST."; exit 1; }
+          SEG_COUNT=$(ls out/seg_"${Q}"_*.ts | wc -l)
+          test "$SEG_COUNT" -gt 0 || { echo "::error::Tidak ada segmen .ts yang dihasilkan."; exit 1; }
+          FIRST_SEG=$(ls out/seg_"${Q}"_*.ts | head -1)
+          echo "--- segmen pertama ($FIRST_SEG) ---"
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_name,width,height \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1 "$FIRST_SEG"
+          CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$FIRST_SEG")
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$FIRST_SEG")
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$FIRST_SEG")
+          test "$CODEC" = "h264" || { echo "::error::Codec segmen '$CODEC', bukan h264."; exit 1; }
+          test "$WIDTH" = "${{ matrix.width }}" || { echo "::error::Lebar segmen $WIDTH, bukan ${{ matrix.width }}."; exit 1; }
+          test "$HEIGHT" = "${{ matrix.height }}" || { echo "::error::Tinggi segmen $HEIGHT, bukan ${{ matrix.height }}."; exit 1; }
+          test -f "out/${Q}.mp4" || { echo "::error::MP4 progresif out/${Q}.mp4 tidak ada."; exit 1; }
+          MP4_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "out/${Q}.mp4")
+          echo "Durasi MP4: ${MP4_DUR} detik"
+          TOTAL_BYTES=$(du -sb out | cut -f1)
+          python3 -c "
+          import json
+          json.dump({
+            'film_slug': '${{ inputs.film_slug }}',
+            'quality': '$Q',
+            'segments': $SEG_COUNT,
+            'segment_seconds': 6,
+            'mp4_duration_seconds': float('$MP4_DUR'),
+            'total_bytes': $TOTAL_BYTES,
+            'transcode_seconds': int('${{ env.TRANSCODE_SECONDS }}'),
+            'source': 'synthetic' if '${{ inputs.source_url }}' == '' else 'url',
+            'validated': True,
+          }, open('out/summary-${Q}.json', 'w'), indent=2)
+          "
+          echo "VALID: $SEG_COUNT segmen HLS $Q + MP4 progresif, codec h264 ${{ matrix.width }}x${{ matrix.height }}."
+
+      - name: Unggah hasil ke B2
+        if: inputs.upload
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          bash scripts/upload-b2.sh out "$B2_BUCKET" "films/${{ inputs.film_slug }}/${{ matrix.quality }}"
+
+      - name: Unggah B2 dilewati
+        if: ${{ !inputs.upload }}
+        run: |
+          echo "Input upload=false, jadi hasil tidak diunggah ke B2."
+          echo "Untuk mengunggah: jalankan ulang dengan upload=true sesudah secrets B2_KEY_ID, B2_APP_KEY, dan B2_BUCKET diisi di repo ini."
+
+      - name: Simpan playlist dan ringkasan sebagai artefak
+        uses: actions/upload-artifact@v4
+        with:
+          name: hls-${{ matrix.quality }}-manifests
+          path: |
+            out/stream_${{ matrix.quality }}.m3u8
+            out/summary-${{ matrix.quality }}.json
+          retention-days: 30
+
+  master:
+    name: Master playlist
+    needs: transcode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ambil playlist tiap kualitas
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hls-*-manifests
+          merge-multiple: true
+          path: manifests
+
+      - name: Pasang rclone (bila unggah aktif)
+        if: inputs.upload
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Buat master.m3u8
+        run: |
+          ls manifests/
+          for q in 360p 720p 1080p; do
+            test -f "manifests/stream_${q}.m3u8" || { echo "::error::Playlist $q tidak ada di artefak."; exit 1; }
+          done
+          mkdir -p master
+          cat > master/master.m3u8 <<'EOF'
+          #EXTM3U
+          #EXT-X-VERSION:3
+          #EXT-X-STREAM-INF:BANDWIDTH=1128000,RESOLUTION=640x360
+          360p/stream_360p.m3u8
+          #EXT-X-STREAM-INF:BANDWIDTH=2628000,RESOLUTION=1280x720
+          720p/stream_720p.m3u8
+          #EXT-X-STREAM-INF:BANDWIDTH=6128000,RESOLUTION=1920x1080
+          1080p/stream_1080p.m3u8
+          EOF
+          cat master/master.m3u8
+          echo "Master playlist dibuat. BANDWIDTH = bitrate video + audio 128k per kualitas."
+
+      - name: Simpan master playlist sebagai artefak
+        uses: actions/upload-artifact@v4
+        with:
+          name: hls-master-manifest
+          path: master/master.m3u8
+          retention-days: 30
+
+      - name: Unggah master playlist ke B2
+        if: inputs.upload
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          bash scripts/upload-b2.sh master "$B2_BUCKET" "films/${{ inputs.film_slug }}"
