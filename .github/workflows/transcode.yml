@@ -139,18 +139,21 @@ jobs:
           test "$SEG_COUNT" -gt 0 || { echo "::error::Tidak ada segmen .ts yang dihasilkan."; exit 1; }
           FIRST_SEG=$(ls out/seg_"${Q}"_*.ts | head -1)
           echo "--- segmen pertama ($FIRST_SEG) ---"
-          ffprobe -v error -select_streams v:0 \
-            -show_entries stream=codec_name,width,height \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1 "$FIRST_SEG"
-          CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$FIRST_SEG")
-          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$FIRST_SEG")
-          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$FIRST_SEG")
+          # ffprobe -of csv/default pada file .ts mencetak tiap stream DUA
+          # KALI (sekali di bawah programs, sekali di bawah streams),
+          # jadi pembacaan nilai wajib lewat JSON dan ambil streams[0].
+          # (Terbukti di run 44026554768: csv mengembalikan "h264" dua
+          # baris dan validasi salah vonis codec bukan h264.)
+          SEG_JSON=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of json "$FIRST_SEG")
+          echo "$SEG_JSON"
+          CODEC=$(printf '%s' "$SEG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0]['codec_name'])")
+          WIDTH=$(printf '%s' "$SEG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0]['width'])")
+          HEIGHT=$(printf '%s' "$SEG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0]['height'])")
           test "$CODEC" = "h264" || { echo "::error::Codec segmen '$CODEC', bukan h264."; exit 1; }
           test "$WIDTH" = "${{ matrix.width }}" || { echo "::error::Lebar segmen $WIDTH, bukan ${{ matrix.width }}."; exit 1; }
           test "$HEIGHT" = "${{ matrix.height }}" || { echo "::error::Tinggi segmen $HEIGHT, bukan ${{ matrix.height }}."; exit 1; }
           test -f "out/${Q}.mp4" || { echo "::error::MP4 progresif out/${Q}.mp4 tidak ada."; exit 1; }
-          MP4_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "out/${Q}.mp4")
+          MP4_DUR=$(ffprobe -v error -show_entries format=duration -of json "out/${Q}.mp4" | python3 -c "import json,sys; print(json.load(sys.stdin)['format']['duration'])")
           echo "Durasi MP4: ${MP4_DUR} detik"
           TOTAL_BYTES=$(du -sb out | cut -f1)
           python3 -c "
