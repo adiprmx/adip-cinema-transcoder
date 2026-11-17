@@ -135,9 +135,35 @@ jadi). Server rumah adalah transcoder cadangan kedua, sesudah ada.
 
 ## Status uji
 
-Run tes pertama (video sintetis 30 detik, ketiga kualitas, tanpa
-unggah B2): belum jalan saat README ini ditulis. Bagian ini
-diperbarui sesudah run pertama hijau, dengan tautan ke run-nya.
+Run tes pertama HIJAU pada 17 Nov 2026:
+https://github.com/adiprmx/adip-cinema-transcoder/actions/runs/44027158343
+
+Video sintetis 30 detik (testsrc2 plus nada 440 Hz), ketiga kualitas,
+tanpa unggah B2. Keempat job sukses: Transcode 360p (51 detik),
+720p (64 detik), 1080p (70 detik), Master playlist (8 detik). Tiap
+job menghasilkan 4 segmen HLS plus MP4 progresif 30,02 detik, dan
+validasi ffprobe di dalam job mengonfirmasi codec h264 dengan
+resolusi yang benar. Waktu transcode murni yang terukur di runner:
+360p 3 detik, 720p 5 detik, 1080p 7 detik untuk 30 detik video.
+Itu jauh lebih cepat dari perkiraan berbasis VM di tabel atas, tapi
+perkiraan konservatif tetap dipakai untuk perencanaan sampai satu
+film asli benar-benar ditranscode.
+
+Satu catatan dari run pertama (44026554768, gagal): ffprobe
+`-of csv` pada file `.ts` mencetak tiap stream dua kali (sekali di
+bawah programs, sekali di bawah streams), sehingga validasi salah
+vonis codec bukan h264. Perbaikannya: baca nilai lewat JSON dan
+ambil `streams[0]`. Sudah diperbaiki dan terbukti di run hijau.
+
+Tes negatif (run 44027704831, 17 Nov 2026):
+https://github.com/adiprmx/adip-cinema-transcoder/actions/runs/44027704831
+
+Dispatch dengan `upload=true` sementara secrets B2 masih kosong.
+Hasilnya sesuai rancangan: validasi ffprobe lolos dulu di ketiga job
+("VALID: 4 segmen HLS ..."), lalu langkah unggah gagal dengan pesan
+"ERROR: secrets B2 belum diisi." plus petunjuk secrets mana yang
+harus diisi. Run ini memang gagal, dan kegagalan itu adalah bukti
+pengaman bekerja, bukan cacat.
 
 Transcode film asli (Bougainvillea) belum bisa: file-nya belum ada
 di B2 atau Drive dalam bentuk URL yang bisa diakses Actions.
